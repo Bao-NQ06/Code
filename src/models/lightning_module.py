@@ -1,5 +1,6 @@
 """
 PyTorch Lightning module for Whisper fine-tuning with LoRA + optional MoE.
+Includes W&B logging for prediction tables and audio samples.
 """
 
 import torch
@@ -21,6 +22,15 @@ class WhisperFineTuneModule(pl.LightningModule):
         self.moe_loss_weight = cfg.get("moe", {}).get(
             "load_balance_weight", 0.01
         )
+
+        # W&B prediction logging config
+        wandb_cfg = cfg.get("logging", {}).get("wandb", {})
+        self._log_predictions = wandb_cfg.get("log_predictions", False)
+        self._log_audio = wandb_cfg.get("log_audio", False)
+        self._log_pred_every_n = wandb_cfg.get(
+            "log_predictions_every_n_steps", 500
+        )
+
         self.save_hyperparameters(ignore=["model", "processor"])
 
     def forward(self, input_features, labels=None):
@@ -56,6 +66,13 @@ class WhisperFineTuneModule(pl.LightningModule):
         metrics = self._decode_and_eval(batch)
         self.log("val_wer", metrics["wer"], prog_bar=True, sync_dist=True)
         self.log("val_cer", metrics["cer"], prog_bar=True, sync_dist=True)
+
+        # Log prediction samples to W&B
+        if batch_idx == 0 and self._log_predictions:
+            self._log_wandb_predictions(
+                metrics["preds"], metrics["refs"], batch, prefix="val"
+            )
+
         return {"val_loss": loss, **metrics}
 
     def test_step(self, batch, batch_idx):
@@ -89,6 +106,48 @@ class WhisperFineTuneModule(pl.LightningModule):
         wer = compute_wer(predictions=preds, references=refs)
         cer = compute_cer(predictions=preds, references=refs)
         return {"wer": wer, "cer": cer, "preds": preds, "refs": refs}
+
+    def _log_wandb_predictions(self, preds, refs, batch, prefix="val"):
+        """Log sample predictions to W&B as a Table."""
+        try:
+            import wandb
+        except ImportError:
+            return
+
+        if not isinstance(self.logger, pl.loggers.WandbLogger):
+            # Check if logger is a list (multiple loggers)
+            loggers = self.logger if isinstance(self.logger, list) else [self.logger]
+            wandb_logger = None
+            for lg in loggers:
+                if isinstance(lg, pl.loggers.WandbLogger):
+                    wandb_logger = lg
+                    break
+            if wandb_logger is None:
+                return
+        else:
+            wandb_logger = self.logger
+
+        columns = ["reference", "prediction", "wer", "cer"]
+        if self._log_audio:
+            columns.insert(0, "audio")
+
+        table = wandb.Table(columns=columns)
+        n_samples = min(8, len(preds))
+
+        for i in range(n_samples):
+            sample_wer = compute_wer([preds[i]], [refs[i]])
+            sample_cer = compute_cer([preds[i]], [refs[i]])
+            row = [refs[i], preds[i], round(sample_wer, 4), round(sample_cer, 4)]
+
+            if self._log_audio:
+                audio_np = batch["input_features"][i].cpu().numpy()
+                row.insert(0, wandb.Audio(audio_np, sample_rate=16000))
+
+            table.add_data(*row)
+
+        wandb_logger.experiment.log(
+            {f"{prefix}_predictions": table, "global_step": self.global_step}
+        )
 
     def _collect_moe_aux_loss(self) -> torch.Tensor | None:
         """Collect MoE auxiliary losses from all MoE layers."""

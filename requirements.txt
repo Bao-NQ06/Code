@@ -34,9 +34,9 @@ pyyaml>=6.0
 # --- Demo ---
 gradio>=4.20.0
 
-# --- Logging (optional) ---
+# --- Logging ---
 tensorboard>=2.16.0
-# wandb>=0.16.0        # Uncomment for W&B logging
+wandb>=0.16.0
 
 # --- Utilities ---
 tqdm>=4.66.0

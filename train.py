@@ -19,7 +19,7 @@ from pytorch_lightning.callbacks import (
     LearningRateMonitor,
     RichProgressBar,
 )
-from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
+from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger, WandbLogger
 
 from src.data.datamodule import WhisperDataModule
 from src.models.whisper_lora import build_whisper_lora_model
@@ -83,19 +83,74 @@ def build_callbacks(cfg: dict) -> list:
 
 
 def build_logger(cfg: dict):
-    """Build Lightning logger."""
+    """Build Lightning logger(s). Supports tensorboard, wandb, csv, or combined."""
     log_cfg = cfg.get("logging", {})
     paths_cfg = cfg["paths"]
     logger_type = log_cfg.get("logger", "tensorboard")
+    wandb_cfg = log_cfg.get("wandb", {})
 
-    if logger_type == "tensorboard":
-        return TensorBoardLogger(
+    loggers = []
+
+    # Support comma-separated loggers like "wandb,tensorboard"
+    logger_types = [l.strip() for l in logger_type.split(",")]
+
+    for lt in logger_types:
+        if lt == "wandb":
+            loggers.append(_build_wandb_logger(cfg, log_cfg, wandb_cfg, paths_cfg))
+        elif lt == "tensorboard":
+            loggers.append(TensorBoardLogger(
+                save_dir=paths_cfg["log_dir"],
+                name=log_cfg.get("project_name", "whisper-vi"),
+            ))
+        elif lt == "csv":
+            loggers.append(CSVLogger(
+                save_dir=paths_cfg["log_dir"],
+                name=log_cfg.get("project_name", "whisper-vi"),
+            ))
+
+    if not loggers:
+        loggers.append(CSVLogger(
             save_dir=paths_cfg["log_dir"],
             name=log_cfg.get("project_name", "whisper-vi"),
-        )
-    return CSVLogger(
+        ))
+
+    return loggers if len(loggers) > 1 else loggers[0]
+
+
+def _build_wandb_logger(cfg, log_cfg, wandb_cfg, paths_cfg):
+    """Build a WandbLogger with full config tracking."""
+    # Build a flat summary of key hyperparameters for W&B config
+    hparams = {
+        "model_name": cfg["model"]["name"],
+        "language": cfg["model"].get("language", "vi"),
+        "freeze_encoder": cfg["model"].get("freeze_encoder", False),
+        "lora_enabled": cfg["lora"].get("enabled", True),
+        "lora_r": cfg["lora"].get("r", 16),
+        "lora_alpha": cfg["lora"].get("alpha", 32),
+        "lora_dropout": cfg["lora"].get("dropout", 0.05),
+        "lora_targets": cfg["lora"].get("target_modules", []),
+        "moe_enabled": cfg.get("moe", {}).get("enabled", False),
+        "moe_num_experts": cfg.get("moe", {}).get("num_experts", 4),
+        "moe_top_k": cfg.get("moe", {}).get("top_k", 2),
+        "batch_size": cfg["training"]["batch_size"],
+        "learning_rate": cfg["training"]["learning_rate"],
+        "weight_decay": cfg["training"].get("weight_decay", 0.01),
+        "max_epochs": cfg["training"]["max_epochs"],
+        "warmup_steps": cfg["training"].get("warmup_steps", 500),
+        "gradient_accumulation": cfg["training"].get("gradient_accumulation_steps", 1),
+        "scheduler": cfg.get("optimizer", {}).get("scheduler", "cosine"),
+        "precision": cfg["hardware"].get("precision", "16-mixed"),
+    }
+
+    return WandbLogger(
+        project=wandb_cfg.get("project", log_cfg.get("project_name", "whisper-vi-finetune")),
+        name=wandb_cfg.get("run_name", log_cfg.get("run_name")),
         save_dir=paths_cfg["log_dir"],
-        name=log_cfg.get("project_name", "whisper-vi"),
+        log_model=wandb_cfg.get("log_model", False),
+        tags=wandb_cfg.get("tags", ["whisper", "vietnamese", "lora"]),
+        notes=wandb_cfg.get("notes", "Whisper Vietnamese fine-tuning with LoRA"),
+        config=hparams,
+        group=wandb_cfg.get("group", None),
     )
 
 
