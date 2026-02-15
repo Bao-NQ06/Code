@@ -1,0 +1,94 @@
+# =============================================================================
+# Whisper Vietnamese Fine-tuning Configuration
+# =============================================================================
+
+# --- Model ---
+model:
+  # Whisper model name: tiny, base, small, medium, large, large-v2, large-v3
+  name: "openai/whisper-small"
+  language: "vi"
+  task: "transcribe"
+  freeze_encoder: false    # Freeze encoder for faster training (optional)
+  freeze_embed: true       # Freeze embedding layers
+
+# --- LoRA ---
+lora:
+  enabled: true
+  r: 16                    # LoRA rank
+  alpha: 32                # LoRA alpha scaling
+  dropout: 0.05
+  target_modules:          # Modules to apply LoRA
+    - "q_proj"
+    - "v_proj"
+    - "k_proj"
+    - "out_proj"
+    - "fc1"
+    - "fc2"
+  bias: "none"             # none, all, lora_only
+
+# --- MoE (Mixture of Experts) ---
+moe:
+  enabled: false           # Set to true to enable MoE
+  num_experts: 4           # Number of expert FFN modules
+  top_k: 2                 # Top-k experts to activate per token
+  capacity_factor: 1.25    # Expert capacity factor
+  load_balance_weight: 0.01  # Auxiliary loss weight for load balancing
+  apply_to: "decoder"      # "decoder" or "both"
+  replace_every_n: 2       # Replace FFN every N layers with MoE
+
+# --- Data ---
+data:
+  train_data_dir: "data/train"       # Directory containing parquet files
+  val_split: 0.05                    # Validation split ratio
+  test_split: 0.05                   # Test split ratio
+  seed: 42
+  max_audio_length: 30.0             # Max audio duration in seconds
+  sample_rate: 16000                 # Whisper expects 16kHz
+  num_workers: 4
+  pin_memory: true
+  audio_column: "audio"              # Column name for audio in parquet
+  text_column: "sentence"            # Column name for transcript
+  province_column: "province_name"   # Column for dialect analysis
+  gender_column: "gender"
+
+# --- Training ---
+training:
+  batch_size: 8
+  gradient_accumulation_steps: 2
+  max_epochs: 10
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 500
+  max_steps: -1            # -1 means use max_epochs
+  fp16: true               # Mixed precision training
+  bf16: false
+  gradient_clip_val: 1.0
+  val_check_interval: 0.25 # Validate every 25% of epoch
+  log_every_n_steps: 50
+  save_top_k: 3            # Save top-k checkpoints by WER
+  early_stopping_patience: 5
+
+# --- Optimizer ---
+optimizer:
+  name: "adamw"            # adamw, adam, sgd
+  scheduler: "cosine"      # cosine, linear, constant, cosine_with_restarts
+  num_warmup_steps: 500
+
+# --- Paths ---
+paths:
+  output_dir: "outputs"
+  checkpoint_dir: "outputs/checkpoints"
+  log_dir: "outputs/logs"
+
+# --- Logging ---
+logging:
+  logger: "tensorboard"     # tensorboard, wandb, csv
+  project_name: "whisper-vi-finetune"
+  run_name: null            # Auto-generated if null
+
+# --- Hardware ---
+hardware:
+  accelerator: "gpu"        # gpu, cpu, tpu
+  devices: 1                # Number of GPUs
+  strategy: "auto"          # auto, ddp, deepspeed
+  precision: "16-mixed"     # 16-mixed, bf16-mixed, 32
