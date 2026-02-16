@@ -34,9 +34,9 @@ def build_whisper_lora_model(cfg: dict):
         task=model_cfg.get("task", "transcribe"),
     )
 
-    # Configure model for generation
-    model.config.forced_decoder_ids = None
-    model.config.suppress_tokens = []
+    # Configure generation settings (must use generation_config, not model.config)
+    model.generation_config.forced_decoder_ids = None
+    model.generation_config.suppress_tokens = []
     model.config.use_cache = False  # Required for gradient checkpointing
 
     # Freeze encoder if requested
@@ -55,9 +55,17 @@ def build_whisper_lora_model(cfg: dict):
         print("Injecting MoE layers into Whisper")
         model = inject_moe_into_whisper(model, moe_cfg)
 
-    # --- Apply LoRA ---
+    # --- Apply LoRA FIRST, then gradient checkpointing ---
     if lora_cfg.get("enabled", True):
         model = _apply_lora(model, lora_cfg)
+
+    # Gradient checkpointing MUST be enabled AFTER PEFT wrapping
+    # and MUST use use_reentrant=False to work with LoRA
+    if model_cfg.get("gradient_checkpointing", True):
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        print("Gradient checkpointing enabled (use_reentrant=False)")
 
     _print_trainable_params(model)
     return model, processor

@@ -1,7 +1,9 @@
 """
 PyTorch Lightning DataModule for Whisper Vietnamese fine-tuning.
+Zero-copy: splits are just index lists, no data duplication on disk or RAM.
 """
 
+import torch
 from torch.utils.data import DataLoader, random_split
 import pytorch_lightning as pl
 from transformers import WhisperFeatureExtractor, WhisperTokenizer
@@ -10,7 +12,11 @@ from src.data.dataset import VietnameseASRDataset, DataCollatorSpeechSeq2Seq
 
 
 class WhisperDataModule(pl.LightningDataModule):
-    """Lightning DataModule wrapping VietnameseASRDataset."""
+    """Lightning DataModule wrapping VietnameseASRDataset.
+
+    The train/val/test split is purely index-based (random_split stores
+    only a list of integer indices, not copies of the data).
+    """
 
     def __init__(self, cfg: dict):
         super().__init__()
@@ -23,8 +29,10 @@ class WhisperDataModule(pl.LightningDataModule):
         self.test_split = data_cfg.get("test_split", 0.05)
         self.seed = data_cfg.get("seed", 42)
         self.batch_size = cfg["training"]["batch_size"]
-        self.num_workers = data_cfg.get("num_workers", 4)
-        self.pin_memory = data_cfg.get("pin_memory", True)
+
+        # Colab: num_workers=0 avoids forked processes duplicating RAM
+        self.num_workers = data_cfg.get("num_workers", 0)
+        self.pin_memory = data_cfg.get("pin_memory", False)
 
         self.feature_extractor = WhisperFeatureExtractor.from_pretrained(
             model_cfg["name"]
@@ -39,7 +47,6 @@ class WhisperDataModule(pl.LightningDataModule):
             tokenizer=self.tokenizer,
         )
 
-        # Optionally import normalize function
         self.normalize_fn = None
         try:
             from src.utils.text_normalize import normalize_vietnamese
@@ -52,7 +59,7 @@ class WhisperDataModule(pl.LightningDataModule):
         self.test_dataset = None
 
     def setup(self, stage: str = None):
-        """Load data and split into train/val/test."""
+        """Load data index and split into train/val/test (no data copied)."""
         full_dataset = VietnameseASRDataset(
             data_dir=self.data_dir,
             feature_extractor=self.feature_extractor,
@@ -69,14 +76,12 @@ class WhisperDataModule(pl.LightningDataModule):
         test_size = int(total * self.test_split)
         train_size = total - val_size - test_size
 
-        import torch
+        # random_split only stores index lists, not data copies
         generator = torch.Generator().manual_seed(self.seed)
         self.train_dataset, self.val_dataset, self.test_dataset = random_split(
             full_dataset, [train_size, val_size, test_size], generator=generator
         )
-        print(
-            f"Split: train={train_size}, val={val_size}, test={test_size}"
-        )
+        print(f"Split: train={train_size}, val={val_size}, test={test_size}")
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(

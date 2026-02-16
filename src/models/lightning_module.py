@@ -1,6 +1,6 @@
 """
 PyTorch Lightning module for Whisper fine-tuning with LoRA + optional MoE.
-Includes W&B logging for prediction tables and audio samples.
+Memory-safe: generation runs only on first val batch, 1 sample at a time.
 """
 
 import torch
@@ -23,13 +23,9 @@ class WhisperFineTuneModule(pl.LightningModule):
             "load_balance_weight", 0.01
         )
 
-        # W&B prediction logging config
         wandb_cfg = cfg.get("logging", {}).get("wandb", {})
         self._log_predictions = wandb_cfg.get("log_predictions", False)
         self._log_audio = wandb_cfg.get("log_audio", False)
-        self._log_pred_every_n = wandb_cfg.get(
-            "log_predictions_every_n_steps", 500
-        )
 
         self.save_hyperparameters(ignore=["model", "processor"])
 
@@ -44,7 +40,6 @@ class WhisperFineTuneModule(pl.LightningModule):
         )
         loss = outputs.loss
 
-        # Add MoE load-balancing auxiliary loss
         if self.moe_enabled:
             aux_loss = self._collect_moe_aux_loss()
             if aux_loss is not None:
@@ -59,95 +54,92 @@ class WhisperFineTuneModule(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, outputs = self._compute_loss(batch)
+        loss, _ = self._compute_loss(batch)
         self.log("val_loss", loss, prog_bar=True, sync_dist=True)
 
-        # Decode predictions and compute metrics
-        metrics = self._decode_and_eval(batch)
-        self.log("val_wer", metrics["wer"], prog_bar=True, sync_dist=True)
-        self.log("val_cer", metrics["cer"], prog_bar=True, sync_dist=True)
+        # Only run expensive generation on 1st batch, NEVER during sanity check
+        if batch_idx == 0 and not self.trainer.sanity_checking:
+            metrics = self._decode_and_eval(batch)
+            self.log("val_wer", metrics["wer"], prog_bar=True, sync_dist=True)
+            self.log("val_cer", metrics["cer"], prog_bar=True, sync_dist=True)
 
-        # Log prediction samples to W&B
-        if batch_idx == 0 and self._log_predictions:
-            self._log_wandb_predictions(
-                metrics["preds"], metrics["refs"], batch, prefix="val"
-            )
+            if self._log_predictions:
+                self._log_wandb_predictions(
+                    metrics["preds"], metrics["refs"], prefix="val"
+                )
 
-        return {"val_loss": loss, **metrics}
+        return {"val_loss": loss}
 
     def test_step(self, batch, batch_idx):
         loss, _ = self._compute_loss(batch)
-        metrics = self._decode_and_eval(batch)
         self.log("test_loss", loss, sync_dist=True)
+
+        metrics = self._decode_and_eval(batch)
         self.log("test_wer", metrics["wer"], sync_dist=True)
         self.log("test_cer", metrics["cer"], sync_dist=True)
         return {"test_loss": loss, **metrics}
 
     def _decode_and_eval(self, batch) -> dict:
-        """Generate transcriptions and compute WER/CER."""
-        # Generate predictions
+        """Generate transcriptions 1 sample at a time to limit GPU memory."""
+        preds = []
+        # Generate one sample at a time to avoid GPU OOM
         with torch.no_grad():
-            generated_ids = self.model.generate(
-                input_features=batch["input_features"],
-                language="vi",
-                task="transcribe",
-            )
+            self.model.config.use_cache = True
+            try:
+                for i in range(batch["input_features"].shape[0]):
+                    single = batch["input_features"][i:i+1]
+                    gen_ids = self.model.generate(
+                        input_features=single,
+                        language="vi",
+                        task="transcribe",
+                        max_new_tokens=225,
+                    )
+                    text = self.processor.batch_decode(
+                        gen_ids, skip_special_tokens=True
+                    )[0]
+                    preds.append(text)
+            finally:
+                self.model.config.use_cache = False
 
-        # Decode predictions and references
-        preds = self.processor.batch_decode(
-            generated_ids, skip_special_tokens=True
-        )
+        # Decode references
         labels = batch["labels"].clone()
         labels[labels == -100] = self.processor.tokenizer.pad_token_id
-        refs = self.processor.batch_decode(
-            labels, skip_special_tokens=True
-        )
+        refs = self.processor.batch_decode(labels, skip_special_tokens=True)
 
         wer = compute_wer(predictions=preds, references=refs)
         cer = compute_cer(predictions=preds, references=refs)
         return {"wer": wer, "cer": cer, "preds": preds, "refs": refs}
 
-    def _log_wandb_predictions(self, preds, refs, batch, prefix="val"):
+    def _log_wandb_predictions(self, preds, refs, prefix="val"):
         """Log sample predictions to W&B as a Table."""
         try:
             import wandb
         except ImportError:
             return
 
-        if not isinstance(self.logger, pl.loggers.WandbLogger):
-            # Check if logger is a list (multiple loggers)
-            loggers = self.logger if isinstance(self.logger, list) else [self.logger]
-            wandb_logger = None
-            for lg in loggers:
-                if isinstance(lg, pl.loggers.WandbLogger):
-                    wandb_logger = lg
-                    break
-            if wandb_logger is None:
-                return
-        else:
-            wandb_logger = self.logger
+        wandb_logger = self._find_wandb_logger()
+        if wandb_logger is None:
+            return
 
         columns = ["reference", "prediction", "wer", "cer"]
-        if self._log_audio:
-            columns.insert(0, "audio")
-
         table = wandb.Table(columns=columns)
-        n_samples = min(8, len(preds))
 
-        for i in range(n_samples):
-            sample_wer = compute_wer([preds[i]], [refs[i]])
-            sample_cer = compute_cer([preds[i]], [refs[i]])
-            row = [refs[i], preds[i], round(sample_wer, 4), round(sample_cer, 4)]
-
-            if self._log_audio:
-                audio_np = batch["input_features"][i].cpu().numpy()
-                row.insert(0, wandb.Audio(audio_np, sample_rate=16000))
-
-            table.add_data(*row)
+        for i in range(min(8, len(preds))):
+            s_wer = compute_wer([preds[i]], [refs[i]])
+            s_cer = compute_cer([preds[i]], [refs[i]])
+            table.add_data(refs[i], preds[i], round(s_wer, 4), round(s_cer, 4))
 
         wandb_logger.experiment.log(
             {f"{prefix}_predictions": table, "global_step": self.global_step}
         )
+
+    def _find_wandb_logger(self):
+        """Find W&B logger from trainer loggers."""
+        loggers = self.logger if isinstance(self.logger, list) else [self.logger]
+        for lg in loggers:
+            if isinstance(lg, pl.loggers.WandbLogger):
+                return lg
+        return None
 
     def _collect_moe_aux_loss(self) -> torch.Tensor | None:
         """Collect MoE auxiliary losses from all MoE layers."""
@@ -167,8 +159,7 @@ class WhisperFineTuneModule(pl.LightningModule):
                 aux = getattr(layer, "_moe_aux_loss", None)
                 if aux is not None:
                     total_aux = aux if total_aux is None else total_aux + aux
-                    layer._moe_aux_loss = None  # Reset
-
+                    layer._moe_aux_loss = None
         return total_aux
 
     def configure_optimizers(self):
@@ -176,16 +167,13 @@ class WhisperFineTuneModule(pl.LightningModule):
         train_cfg = self.cfg["training"]
         opt_cfg = self.cfg.get("optimizer", {})
 
-        # Filter trainable parameters
         params = [p for p in self.model.parameters() if p.requires_grad]
-
         optimizer = torch.optim.AdamW(
             params,
             lr=train_cfg["learning_rate"],
             weight_decay=train_cfg.get("weight_decay", 0.01),
         )
 
-        # Compute total training steps
         total_steps = self.trainer.estimated_stepping_batches
         warmup_steps = opt_cfg.get(
             "num_warmup_steps", train_cfg.get("warmup_steps", 500)

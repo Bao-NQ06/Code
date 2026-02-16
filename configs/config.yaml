@@ -10,6 +10,7 @@ model:
   task: "transcribe"
   freeze_encoder: false    # Freeze encoder for faster training (optional)
   freeze_embed: true       # Freeze embedding layers
+  gradient_checkpointing: true  # Saves ~40% GPU memory (recomputes activations)
 
 # --- LoRA ---
 lora:
@@ -44,17 +45,17 @@ data:
   seed: 42
   max_audio_length: 30.0             # Max audio duration in seconds
   sample_rate: 16000                 # Whisper expects 16kHz
-  num_workers: 4
-  pin_memory: true
+  num_workers: 0                     # 0 for Colab (workers fork process = duplicate RAM)
+  pin_memory: false                  # Disable on Colab to save system RAM
   audio_column: "audio"              # Column name for audio in parquet
-  text_column: "sentence"            # Column name for transcript
+  text_column: "text"                # Column name for transcript
   province_column: "province_name"   # Column for dialect analysis
   gender_column: "gender"
 
 # --- Training ---
 training:
-  batch_size: 8
-  gradient_accumulation_steps: 2
+  batch_size: 2                      # Minimal for Colab T4 (effective = batch * accum = 16)
+  gradient_accumulation_steps: 8     # Compensate for smaller batch size (effective=16)
   max_epochs: 10
   learning_rate: 1.0e-4
   weight_decay: 0.01

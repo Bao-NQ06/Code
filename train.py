@@ -206,10 +206,20 @@ def main():
         gradient_clip_val=train_cfg.get("gradient_clip_val", 1.0),
         val_check_interval=train_cfg.get("val_check_interval", 0.25),
         log_every_n_steps=train_cfg.get("log_every_n_steps", 50),
+        num_sanity_val_steps=0,  # Skip sanity check to avoid OOM on Colab
         callbacks=build_callbacks(cfg),
         logger=build_logger(cfg),
         deterministic=False,
     )
+
+    # Free memory before training starts
+    import gc
+    gc.collect()
+    import torch as _torch
+    if _torch.cuda.is_available():
+        _torch.cuda.empty_cache()
+        print(f"GPU memory: {_torch.cuda.memory_allocated() / 1e9:.2f} GB allocated, "
+              f"{_torch.cuda.memory_reserved() / 1e9:.2f} GB reserved")
 
     # Train
     print("=" * 60)
