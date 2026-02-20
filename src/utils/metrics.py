@@ -6,6 +6,7 @@ from jiwer import wer as jiwer_wer, cer as jiwer_cer
 from collections import defaultdict
 
 from src.utils.text_normalize import normalize_vietnamese
+from src.models.dialect_adapter import province_to_dialect_idx  # noqa: F401 — re-exported
 
 
 def compute_wer(

@@ -1,16 +1,19 @@
 """
-Main training script for Whisper Vietnamese fine-tuning.
+Main training script — Whisper Vietnamese fine-tuning on RTX 5090.
 
 Usage:
-    python train.py                          # Use default config
-    python train.py --config configs/config.yaml
-    python train.py --model openai/whisper-medium --batch_size 4
-    python train.py --moe_enabled true       # Enable MoE
+    python train.py
+    python train.py --model openai/whisper-large-v3 --batch_size 32
+    python train.py --lora_r 128 --lr 3e-5
+    python train.py --moe_enabled true
+    python train.py --resume_from outputs/checkpoints/last.ckpt
 """
 
 import argparse
+import gc
 import os
 
+import torch
 import yaml
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import (
@@ -26,14 +29,14 @@ from src.models.whisper_lora import build_whisper_lora_model
 from src.models.lightning_module import WhisperFineTuneModule
 
 
-def load_config(config_path: str) -> dict:
-    """Load YAML config file."""
-    with open(config_path, "r", encoding="utf-8") as f:
+# ── Config ────────────────────────────────────────────────────────────────────
+
+def load_config(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
-def override_config(cfg: dict, args: argparse.Namespace) -> dict:
-    """Override config values with CLI arguments."""
+def apply_cli_overrides(cfg: dict, args: argparse.Namespace) -> dict:
     if args.model:
         cfg["model"]["name"] = args.model
     if args.batch_size:
@@ -55,14 +58,15 @@ def override_config(cfg: dict, args: argparse.Namespace) -> dict:
     return cfg
 
 
-def build_callbacks(cfg: dict) -> list:
-    """Build Lightning callbacks."""
-    train_cfg = cfg["training"]
-    paths_cfg = cfg["paths"]
+# ── Callbacks & loggers ───────────────────────────────────────────────────────
 
-    callbacks = [
+def build_callbacks(cfg: dict) -> list:
+    train_cfg = cfg["training"]
+    ckpt_dir = cfg["paths"]["checkpoint_dir"]
+
+    return [
         ModelCheckpoint(
-            dirpath=paths_cfg["checkpoint_dir"],
+            dirpath=ckpt_dir,
             filename="whisper-vi-{epoch:02d}-{val_wer:.4f}",
             monitor="val_wer",
             mode="min",
@@ -79,22 +83,15 @@ def build_callbacks(cfg: dict) -> list:
         LearningRateMonitor(logging_interval="step"),
         RichProgressBar(),
     ]
-    return callbacks
 
 
 def build_logger(cfg: dict):
-    """Build Lightning logger(s). Supports tensorboard, wandb, csv, or combined."""
     log_cfg = cfg.get("logging", {})
     paths_cfg = cfg["paths"]
-    logger_type = log_cfg.get("logger", "tensorboard")
     wandb_cfg = log_cfg.get("wandb", {})
-
     loggers = []
 
-    # Support comma-separated loggers like "wandb,tensorboard"
-    logger_types = [l.strip() for l in logger_type.split(",")]
-
-    for lt in logger_types:
+    for lt in [s.strip() for s in log_cfg.get("logger", "csv").split(",")]:
         if lt == "wandb":
             loggers.append(_build_wandb_logger(cfg, log_cfg, wandb_cfg, paths_cfg))
         elif lt == "tensorboard":
@@ -109,133 +106,111 @@ def build_logger(cfg: dict):
             ))
 
     if not loggers:
-        loggers.append(CSVLogger(
-            save_dir=paths_cfg["log_dir"],
-            name=log_cfg.get("project_name", "whisper-vi"),
-        ))
+        loggers.append(CSVLogger(save_dir=paths_cfg["log_dir"]))
 
     return loggers if len(loggers) > 1 else loggers[0]
 
 
-def _build_wandb_logger(cfg, log_cfg, wandb_cfg, paths_cfg):
-    """Build a WandbLogger with full config tracking."""
-    # Build a flat summary of key hyperparameters for W&B config
+def _build_wandb_logger(cfg, log_cfg, wandb_cfg, paths_cfg) -> WandbLogger:
     hparams = {
-        "model_name": cfg["model"]["name"],
-        "language": cfg["model"].get("language", "vi"),
-        "freeze_encoder": cfg["model"].get("freeze_encoder", False),
-        "lora_enabled": cfg["lora"].get("enabled", True),
-        "lora_r": cfg["lora"].get("r", 16),
-        "lora_alpha": cfg["lora"].get("alpha", 32),
-        "lora_dropout": cfg["lora"].get("dropout", 0.05),
-        "lora_targets": cfg["lora"].get("target_modules", []),
-        "moe_enabled": cfg.get("moe", {}).get("enabled", False),
-        "moe_num_experts": cfg.get("moe", {}).get("num_experts", 4),
-        "moe_top_k": cfg.get("moe", {}).get("top_k", 2),
+        "model": cfg["model"]["name"],
+        "lora_r": cfg["lora"].get("r"),
+        "lora_alpha": cfg["lora"].get("alpha"),
+        "moe_enabled": cfg.get("moe", {}).get("enabled"),
+        "daat_enabled": cfg.get("dialect_adapter", {}).get("enabled"),
+        "daat_weight": cfg.get("dialect_adapter", {}).get("aux_loss_weight"),
         "batch_size": cfg["training"]["batch_size"],
-        "learning_rate": cfg["training"]["learning_rate"],
-        "weight_decay": cfg["training"].get("weight_decay", 0.01),
+        "lr": cfg["training"]["learning_rate"],
         "max_epochs": cfg["training"]["max_epochs"],
-        "warmup_steps": cfg["training"].get("warmup_steps", 500),
-        "gradient_accumulation": cfg["training"].get("gradient_accumulation_steps", 1),
-        "scheduler": cfg.get("optimizer", {}).get("scheduler", "cosine"),
-        "precision": cfg["hardware"].get("precision", "16-mixed"),
+        "precision": cfg["hardware"].get("precision"),
+        "flash_attention": cfg["model"].get("flash_attention"),
     }
-
     return WandbLogger(
-        project=wandb_cfg.get("project", log_cfg.get("project_name", "whisper-vi-finetune")),
-        name=wandb_cfg.get("run_name", log_cfg.get("run_name")),
+        project=wandb_cfg.get("project", "whisper-vi-finetune"),
+        name=wandb_cfg.get("run_name"),
         save_dir=paths_cfg["log_dir"],
         log_model=wandb_cfg.get("log_model", False),
-        tags=wandb_cfg.get("tags", ["whisper", "vietnamese", "lora"]),
-        notes=wandb_cfg.get("notes", "Whisper Vietnamese fine-tuning with LoRA"),
+        tags=wandb_cfg.get("tags", []),
+        notes=wandb_cfg.get("notes", ""),
         config=hparams,
-        group=wandb_cfg.get("group", None),
+        group=wandb_cfg.get("group"),
     )
 
 
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser(description="Whisper Vietnamese Fine-tuning")
-    parser.add_argument("--config", type=str, default="configs/config.yaml")
-    parser.add_argument("--model", type=str, default=None)
+    parser.add_argument("--config", default="configs/config.yaml")
+    parser.add_argument("--model", default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--data_dir", type=str, default=None)
+    parser.add_argument("--data_dir", default=None)
     parser.add_argument("--lora_r", type=int, default=None)
-    parser.add_argument("--moe_enabled", type=bool, default=None)
-    parser.add_argument("--freeze_encoder", type=bool, default=None)
+    parser.add_argument("--moe_enabled", type=lambda x: x.lower() == "true", default=None)
+    parser.add_argument("--freeze_encoder", type=lambda x: x.lower() == "true", default=None)
     parser.add_argument("--devices", type=int, default=None)
-    parser.add_argument("--resume_from", type=str, default=None)
+    parser.add_argument("--resume_from", default=None)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    # Load and override config
-    cfg = load_config(args.config)
-    cfg = override_config(cfg, args)
-
-    # Seed everything
+    cfg = apply_cli_overrides(load_config(args.config), args)
     pl.seed_everything(args.seed, workers=True)
 
-    # Create output directories
-    os.makedirs(cfg["paths"]["output_dir"], exist_ok=True)
-    os.makedirs(cfg["paths"]["checkpoint_dir"], exist_ok=True)
-    os.makedirs(cfg["paths"]["log_dir"], exist_ok=True)
+    for d in cfg["paths"].values():
+        os.makedirs(d, exist_ok=True)
 
-    # Build components
     print("=" * 60)
-    print("Building model and data module...")
+    print("Building model…")
     print("=" * 60)
-
-    model, processor = build_whisper_lora_model(cfg)
+    model, processor, dialect_classifier = build_whisper_lora_model(cfg)
     datamodule = WhisperDataModule(cfg)
-    lightning_module = WhisperFineTuneModule(model, processor, cfg)
+    module = WhisperFineTuneModule(model, processor, cfg, dialect_classifier)
 
-    # Build trainer
-    hw_cfg = cfg["hardware"]
+    # Move dialect classifier to same device as model (Lightning handles the rest)
+    if dialect_classifier is not None:
+        module.dialect_classifier = dialect_classifier
+
+    hw = cfg["hardware"]
     train_cfg = cfg["training"]
 
     trainer = pl.Trainer(
         max_epochs=train_cfg["max_epochs"],
         max_steps=train_cfg.get("max_steps", -1),
-        accelerator=hw_cfg.get("accelerator", "gpu"),
-        devices=hw_cfg.get("devices", 1),
-        strategy=hw_cfg.get("strategy", "auto"),
-        precision=hw_cfg.get("precision", "16-mixed"),
+        accelerator=hw.get("accelerator", "gpu"),
+        devices=hw.get("devices", 1),
+        strategy=hw.get("strategy", "auto"),
+        precision=hw.get("precision", "bf16-mixed"),
         accumulate_grad_batches=train_cfg.get("gradient_accumulation_steps", 1),
         gradient_clip_val=train_cfg.get("gradient_clip_val", 1.0),
         val_check_interval=train_cfg.get("val_check_interval", 0.25),
-        log_every_n_steps=train_cfg.get("log_every_n_steps", 50),
-        num_sanity_val_steps=0,  # Skip sanity check to avoid OOM on Colab
+        log_every_n_steps=train_cfg.get("log_every_n_steps", 10),
+        num_sanity_val_steps=1,   # RTX 5090: sanity check is safe
         callbacks=build_callbacks(cfg),
         logger=build_logger(cfg),
-        deterministic=False,
+        deterministic=False,      # Non-deterministic for Flash Attn + compile speed
     )
 
-    # Free memory before training starts
-    import gc
     gc.collect()
-    import torch as _torch
-    if _torch.cuda.is_available():
-        _torch.cuda.empty_cache()
-        print(f"GPU memory: {_torch.cuda.memory_allocated() / 1e9:.2f} GB allocated, "
-              f"{_torch.cuda.memory_reserved() / 1e9:.2f} GB reserved")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        allocated = torch.cuda.memory_allocated() / 1e9
+        reserved = torch.cuda.memory_reserved() / 1e9
+        total = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"GPU: {torch.cuda.get_device_name(0)}  |  "
+              f"{allocated:.1f}/{total:.1f} GB allocated  |  "
+              f"{reserved:.1f} GB reserved")
 
-    # Train
     print("=" * 60)
-    print("Starting training...")
+    print("Starting training…")
     print("=" * 60)
-    trainer.fit(
-        lightning_module,
-        datamodule=datamodule,
-        ckpt_path=args.resume_from,
-    )
+    trainer.fit(module, datamodule=datamodule, ckpt_path=args.resume_from)
 
-    # Test
     print("=" * 60)
-    print("Running test evaluation...")
+    print("Running test evaluation…")
     print("=" * 60)
-    trainer.test(lightning_module, datamodule=datamodule)
+    trainer.test(module, datamodule=datamodule)
 
 
 if __name__ == "__main__":

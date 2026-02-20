@@ -1,42 +1,51 @@
 # =============================================================================
-# Whisper Vietnamese Fine-tuning - Dependencies
+# Whisper Vietnamese Fine-tuning — RTX 5090 Dependencies
+# Python >= 3.11  |  CUDA >= 12.4
 # =============================================================================
 
-# --- Core ML ---
-torch>=2.1.0
-torchaudio>=2.1.0
+# ── Core ML ──────────────────────────────────────────────────────────────────
+torch>=2.3.0
+torchaudio>=2.3.0
 
-# --- Hugging Face ---
-transformers>=4.40.0
-datasets>=2.18.0
-peft>=0.10.0
-accelerate>=0.28.0
+# Flash Attention 2 — significant speedup on RTX 5090 (Blackwell).
+# Install via: pip install flash-attn --no-build-isolation
+# Requires CUDA toolkit installed (nvcc). If unavailable, set
+# model.flash_attention: false in config.yaml to fall back to SDPA.
+flash-attn>=2.6.0
 
-# --- PyTorch Lightning ---
-pytorch-lightning>=2.2.0
-rich>=13.0.0
+# ── Hugging Face stack ────────────────────────────────────────────────────────
+transformers>=4.44.0
+peft>=0.12.0
+accelerate>=0.33.0
+datasets>=2.21.0         # Optional: used only if you switch back to HF datasets
 
-# --- Audio Processing ---
+# ── PyTorch Lightning ─────────────────────────────────────────────────────────
+pytorch-lightning>=2.3.0
+rich>=13.0.0             # RichProgressBar dependency
+
+# ── Audio ─────────────────────────────────────────────────────────────────────
+soundfile>=0.12.1
 librosa>=0.10.0
-soundfile>=0.12.0
+numpy>=1.26.0
 
-# --- Evaluation ---
-jiwer>=3.0.0
+# ── Data / Parquet ────────────────────────────────────────────────────────────
+pyarrow>=16.0.0
+pandas>=2.2.0            # evaluate.py dialect analysis
 
-# --- Data ---
-pandas>=2.0.0
-pyarrow>=15.0.0
-numpy>=1.24.0
+# ── Metrics ───────────────────────────────────────────────────────────────────
+jiwer>=3.0.3
 
-# --- Configuration ---
-pyyaml>=6.0
+# ── Experiment tracking ───────────────────────────────────────────────────────
+wandb>=0.17.0
 
-# --- Demo ---
-gradio>=4.20.0
+# ── Config ────────────────────────────────────────────────────────────────────
+pyyaml>=6.0.1
 
-# --- Logging ---
-tensorboard>=2.16.0
-wandb>=0.16.0
-
+<<<<<<< Current (Your changes)
 # --- Utilities ---
 tqdm>=4.66.0
+flash-attn --no-build-isolation
+=======
+# ── Demo (Gradio) ─────────────────────────────────────────────────────────────
+gradio>=4.36.0
+>>>>>>> Incoming (Background Agent changes)
