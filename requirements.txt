@@ -43,7 +43,6 @@ pyyaml>=6.0.1
 
 # --- Utilities ---
 tqdm>=4.66.0
-flash-attn --no-build-isolation
 
 # ── Demo (Gradio) ─────────────────────────────────────────────────────────────
 gradio>=4.36.0
