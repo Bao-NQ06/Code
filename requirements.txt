@@ -41,11 +41,10 @@ wandb>=0.17.0
 # ── Config ────────────────────────────────────────────────────────────────────
 pyyaml>=6.0.1
 
-<<<<<<< Current (Your changes)
 # --- Utilities ---
 tqdm>=4.66.0
 flash-attn --no-build-isolation
-=======
+
 # ── Demo (Gradio) ─────────────────────────────────────────────────────────────
 gradio>=4.36.0
->>>>>>> Incoming (Background Agent changes)
+
